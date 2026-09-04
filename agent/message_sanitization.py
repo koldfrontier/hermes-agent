@@ -557,12 +557,21 @@ _IMAGE_REJECTION_PHRASES = (
     # HTTP 400 "Invalid request: prepare image failed ...
     # failed to decode image: invalid or unsupported image
     # format". Like the Codex case above, the bad bytes are
-    # baked into immutable conversation history and re-sent on
+    # bad bytes are baked into immutable conversation history and re-sent on
     # every retry, wedging the session. Strip the images so the
     # turn recovers instead of exhausting retries. (issue
     # #76884; complements the proactive full-decode validation
     # in tools/vision_tools._normalize_to_supported_image)
     "failed to decode image",
+    # vLLM (and llama.cpp) multimodal servers enforce a per-request image
+    # count with HTTP 400 "At most 8 image(s) may be provided in one prompt.
+    # Set `--limit-mm-per-prompt` to increase this limit. (parameter=image)".
+    # Attached screenshots accumulate in transcript history, so any later
+    # turn re-sends them and hits the cap — the turn died with no handler.
+    # Match the generic wording so ANY cap value (8/16/32) is caught, not
+    # just the default; the flag name covers future rewordings.
+    "may be provided in one prompt",
+    "limit-mm-per-prompt",
 )
 
 
