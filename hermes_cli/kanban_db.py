@@ -116,13 +116,20 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``container``    — an epic/scaffold whose stories carry the work. Like a
+#                        generic human blocker it parks in ``blocked`` (it is
+#                        the container's intended steady state — NOT
+#                        auto-resumed), but when ``kanban.container_parent_gate``
+#                        is enabled the parent gate treats a blocked
+#                        ``container`` parent as satisfied so its linked stories
+#                        can be claimed/completed without waiting for the epic.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "container"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4567,13 +4574,7 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _parents_satisfied(conn, task_id):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
@@ -4614,15 +4615,86 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+# Legacy container marker: containers blocked before ``--kind container``
+# existed have ``block_kind = NULL``. A comment body or ``blocked``-event
+# reason matching this pattern is the historical "epic container" idiom
+# (RFC 2026-09-06) and qualifies the parent for the container-aware gate.
+# Only consulted when ``kanban.container_parent_gate`` is enabled.
+LEGACY_CONTAINER_RE = re.compile(r"epic container", re.IGNORECASE)
+
+
+def _container_parent_gate_enabled() -> bool:
+    """Return whether blocked container parents satisfy the parent gate.
+
+    Reads ``kanban.container_parent_gate`` from the Hermes config (default
+    ``False`` — strict legacy behaviour where only ``done``/``archived``
+    parents count, so in-flight claims on existing boards are untouched).
+    Mirrors ``review_dispatch_enabled`` (local import to avoid cycles).
+    """
+    try:
+        from hermes_cli.config import load_config  # local import: avoids cycle
+
+        return bool(
+            (load_config() or {}).get("kanban", {}).get("container_parent_gate", False)
+        )
+    except Exception:
+        return False
+
+
+def _is_container_parent(conn: sqlite3.Connection, parent_id: str) -> bool:
+    """Return whether ``parent_id`` is marked as an epic container.
+
+    Typed marker (``block_kind = 'container'``) takes precedence. For parents
+    blocked before the typed kind existed, the legacy marker is any comment
+    body or ``blocked``-event reason matching ``LEGACY_CONTAINER_RE`` (see
+    RFC 2026-09-06-kanban-container-epic-parent-gate).
+    """
+    row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (parent_id,)
+    ).fetchone()
+    if row and row["block_kind"] == "container":
+        return True
+    for c in list_comments(conn, parent_id):
+        if LEGACY_CONTAINER_RE.search(c.body or ""):
+            return True
+    for ev in list_events(conn, parent_id):
+        if ev.kind == "blocked" and ev.payload:
+            reason = ev.payload.get("reason")
+            if isinstance(reason, str) and LEGACY_CONTAINER_RE.search(reason):
+                return True
+    return False
+
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
+    """Return whether every direct parent is terminal for dependency gating.
+
+    With ``kanban.container_parent_gate`` enabled (default off), a parent that
+    is ``blocked`` as an epic container (``block_kind='container'``, or a
+    legacy ``epic container`` marker in comments/blocked events) counts as
+    satisfied — containers are parked by design and only complete when their
+    stories finish, so they must not starve their children's claims. Without
+    the flag the behaviour is unchanged: only ``done``/``archived`` counts.
+    """
+    rows = conn.execute(
+        "SELECT l.parent_id, p.status, p.block_kind "
+        "FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        "AND p.status NOT IN ('done', 'archived')",
         (task_id,),
-    ).fetchone() is None
+    ).fetchall()
+    if not rows:
+        return True
+    if not _container_parent_gate_enabled():
+        return False
+    return all(
+        r["status"] == "blocked"
+        and (
+            r["block_kind"] == "container"
+            or _is_container_parent(conn, r["parent_id"])
+        )
+        for r in rows
+    )
 
 
 def claim_task(
@@ -4642,20 +4714,15 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
+        # parent is not yet terminal (done/archived — or, only when
+        # ``kanban.container_parent_gate`` is enabled, a blocked epic
+        # container). This is the single enforcement point regardless of which
+        # writer (create_task, link_tasks, unblock_task, release_stale_claims,
+        # manual SQL) set status='ready'. If a racy writer promoted a task with
+        # unmet parents, demote it back to 'todo' here — recompute_ready will
+        # re-promote when the parents actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        if not _parents_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -6286,6 +6353,15 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    * ``container`` — an epic/scaffold container whose stories carry the work.
+      Routed to ``blocked`` like a generic human blocker (NOT auto-resumed: it
+      is the container's intended steady state), and it participates in the
+      unblock-loop breaker exactly like a generic block. When
+      ``kanban.container_parent_gate`` is enabled (default off), the parent
+      gate treats a ``blocked`` ``container`` parent as satisfied so its linked
+      stories can be claimed and completed without waiting for the epic to
+      finish.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -6884,18 +6960,13 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     :func:`reopen_review_task`: flipping straight to ``ready`` would bypass the
     parent-completion invariant the dispatcher trusts (it would spawn a child
     whose upstream work isn't finished). If parents are still in progress the
-    task waits in ``todo`` until ``recompute_ready`` picks it up. RCA: Bug 2 at
+    task waits in ``todo`` until ``recompute_ready`` picks it up. With
+    ``kanban.container_parent_gate`` enabled a blocked epic-container parent
+    is treated as satisfied (RFC 2026-09-06). RCA: Bug 2 at
     kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md. Kept in one place
     so the two transitions can't drift.
     """
-    undone_parents = conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return "todo" if undone_parents else "ready"
+    return "todo" if not _parents_satisfied(conn, task_id) else "ready"
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:

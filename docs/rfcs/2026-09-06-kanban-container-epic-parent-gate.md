@@ -1,6 +1,6 @@
 # RFC: Container-aware claim gate — blocked container epics must not gate their stories
 
-- **Status:** Proposed (no code in this change-set; design + mitigation only)
+- **Status:** Accepted — implemented in this change-set (see `kanban.container_parent_gate` + `block --kind container`; tests in `tests/hermes_cli/test_kanban_container_parent_gate.py`)
 - **Date:** 2026-09-06
 - **Component:** Hermes Agent kanban (`hermes_cli/kanban_db.py`)
 - **Discovered by:** lottorun-kanban-monitor during EP-SB deadlock; tracked as GAP `t_37b05cfb` on the `lottorun` board

@@ -670,9 +670,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
             "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
-            "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "blocked for a human; 'transient' marks a maybe-flaky failure; "
+            "'container' parks an epic whose stories carry the work (with "
+            "kanban.container_parent_gate enabled its children can still be "
+            "claimed). Repeated same-kind re-blocks after unblock route the "
+            "task to triage to break unblock loops. Omit for a generic block."
         ),
     )
 
