@@ -345,6 +345,14 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # Container-aware parent gate (RFC 2026-09-06): when true, a parent task that
+  # is blocked as an epic container (`block --kind container`, or a legacy
+  # reason matching "epic container") counts as satisfied for the claim /
+  # promote / complete parent gate, so stories linked to a parked container
+  # epic can be claimed and completed without waiting for the epic itself.
+  # Default false = strict gate (only done/archived parents satisfy) — zero
+  # behaviour change until enabled. See docs/rfcs/2026-09-06-kanban-container-epic-parent-gate.md.
+  container_parent_gate: false
 
 # =============================================================================
 # Terminal Tool Configuration
