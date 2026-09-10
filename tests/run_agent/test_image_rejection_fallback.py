@@ -215,6 +215,11 @@ class TestImageRejectionPhraseIsolation:
             # turn should still switch to text-only/aux-vision mode (#57948).
             "The provided messages input is invalid. The error info is [Unexpected item type in content].",
             "The image data you provided does not represent a valid image. Please check your input and try again.",
+            # vLLM per-request multimodal cap (default 8 images) — same
+            # "At most N image(s) may be provided in one prompt" wording for
+            # any N; the session must strip and retry instead of dying.
+            "HTTP 400: At most 8 image(s) may be provided in one prompt. "
+            "Set `--limit-mm-per-prompt` to increase this limit. (parameter=image)",
         ]
         for body in bodies:
             assert self._matches(body) is True, f"false negative on: {body}"
