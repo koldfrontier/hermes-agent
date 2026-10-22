@@ -18,6 +18,7 @@ import pytest
 from tests.e2e.core._pending_fixes import known_gate
 from tests.e2e.core.providers._anthropic_helpers import Rig, dump, normalised, start_rig, thinking_of
 from tests.fakes.providers.anthropic_messages import ApiError, DropStream, Reply, Text, Thinking
+import itertools
 
 pytestmark = [pytest.mark.skipif(not sys.platform.startswith("linux"), reason="process-tree cleanup uses /proc"),
               pytest.mark.live_system_guard_bypass]
@@ -31,10 +32,7 @@ class StreamDropAcceptedAsAnswer(AssertionError):
 
 
 # Red on current main for a tracked, open bug: key -> (the bug's own failure-message pattern, reason).
-KNOWN: dict[str, tuple[str, str]] = {
-    "stream_drop_retry": (r"user got .*(PARTIAL-THOUGHT|FRAGMENT).* instead of exactly one '(RECOVERED-ANSWER|TURN-ONE)'",
-                          "#121320 stream closed before message_stop is accepted as a complete answer"),
-}
+KNOWN: dict[str, tuple[str, str]] = {}
 
 
 def _answer_must_be(stdout: str, expected: str, fragment: str) -> None:
@@ -58,7 +56,7 @@ def rig_factory(tmp_path: Path):
 
 def _gaps(rig: Rig) -> list[float]:
     t = [r["t"] for r in rig.srv.main_requests()]
-    return [round(b - a, 2) for a, b in zip(t, t[1:])]
+    return [round(b - a, 2) for a, b in itertools.pairwise(t)]
 
 
 def test_429_waits_the_retry_after_then_succeeds(rig_factory) -> None:

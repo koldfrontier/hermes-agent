@@ -11,6 +11,7 @@ it as ``X-Hermes-Session-Token`` on REST and ``?token=`` on WebSocket upgrades, 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-import yaml
+import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
@@ -87,6 +88,7 @@ def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, s
         # The live-DB guard treats $HOME/.hermes/state.db of a pytest descendant as production;
         # this HOME is the test's own tmp dir (asserted above).
         HERMES_STATE_DB_GUARD_BYPASS="1",
+        HERMES_DISABLE_LAZY_INSTALLS="1",
     )
     env.update(extra or {})
     return env
@@ -154,6 +156,7 @@ class Sandbox:
             for p in self.profiles.values():
                 if p.srv is not None:
                     p.srv.stop()
+            self._stop_gateways()
             leaks = _reaper.reap(_reaper.with_home(self.home), *also)
         finally:
             if not self._released:
@@ -162,6 +165,17 @@ class Sandbox:
         if leaks:
             raise SandboxLeak(f"{len(leaks)} sandbox process(es) outlived the test by "
                               f"{_reaper.REAP_TIMEOUT:.0f}s and were killed:\n  " + "\n  ".join(leaks))
+
+
+    def _stop_gateways(self) -> None:
+        """Under the attach model a TUI starts the gateway daemon (setsid, outside the dashboard's
+        process group), which outlives its viewer by design: stop it the way a user would."""
+        for home in (self.hermes_home, *sorted((self.hermes_home / "profiles").glob("*"))):
+            if (home / "gateway.pid").exists():
+                with contextlib.suppress(Exception):
+                    subprocess.run([sys.executable, "-m", "hermes_cli.main", "gateway", "stop"],
+                                   env=self.env({"HERMES_HOME": str(home)}), cwd=str(self.home),
+                                   capture_output=True, timeout=60, check=False)
 
 
 class SandboxLeak(AssertionError):
@@ -184,6 +198,12 @@ def write_profile_home(p: Profile, extra_config: dict[str, Any] | None = None) -
     (p.home / ".env").write_text(f"{PROVIDER_KEY_ENV}={p.provider_key}\n", encoding="utf-8")
 
 
+def _select_test_dependencies(sb: Sandbox) -> None:
+    from tests.e2e.core._pm_dependencies import select_test_dependencies
+
+    select_test_dependencies(sb.hermes_home, REPO_ROOT)
+
+
 def make_sandbox(root: Path, names: tuple[str, ...] = ("default",),
                  responder: Callable[[Profile], Any] | None = None) -> Sandbox:
     """Launch profile at HOME/.hermes, the rest under profiles/<name>; each owns a started provider
@@ -200,6 +220,7 @@ def make_sandbox(root: Path, names: tuple[str, ...] = ("default",),
         write_profile_home(p)
         profiles[name] = p
     sb = Sandbox(root=root, profiles=profiles)
+    _select_test_dependencies(sb)
     _assert_profiles_root_under(sb)
     (root / "web_dist").mkdir(exist_ok=True)
     (root / "web_dist" / "index.html").write_text(
@@ -213,6 +234,7 @@ def _assert_profiles_root_under(sb: Sandbox) -> None:
     probe = subprocess.run(
         [sys.executable, "-c", "from hermes_cli.profiles import _get_profiles_root as r; print(r())"],
         env=sb.env(), cwd=str(sb.home), capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        check=False,
     )
     assert probe.returncode == 0, probe.stderr[-2000:]
     got = Path(probe.stdout.strip().splitlines()[-1]).resolve()
@@ -236,7 +258,7 @@ class Dashboard:
                  argv: tuple[str, ...] = ()) -> None:
         self.sb = sb
         self.log_path = log_path
-        self._log = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - closed in close()
+        self._log = open(log_path, "a", encoding="utf-8")
         env = sb.env({"HERMES_WEB_DIST": str(sb.root / "web_dist"), **(extra_env or {})})
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "hermes_cli.main", "dashboard", "--no-open", "--skip-build",
@@ -325,7 +347,7 @@ def run_py(sb: Sandbox, code: str, *args: str, hermes_home: Path | None = None,
            timeout: float = 120.0) -> subprocess.CompletedProcess:
     extra = {"HERMES_HOME": str(hermes_home)} if hermes_home else None
     return subprocess.run([sys.executable, "-c", code, *args], env=sb.env(extra), cwd=str(sb.home),
-                          capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+                          capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, check=False)
 
 
 SEED_SESSIONS = """
